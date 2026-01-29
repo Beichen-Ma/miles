@@ -681,3 +681,157 @@ def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool
             entropy = logits.new_zeros((0,))
 
     return log_prob, entropy
+
+
+def compute_gepo_weights(
+    log_probs: list[torch.Tensor],
+    loss_masks: list[torch.Tensor],
+    group_indices: list[int],
+    total_lengths: list[int],
+    response_lengths: list[int],
+    parallel_state: "ParallelState",
+) -> tuple[list[torch.Tensor], dict[str, torch.Tensor]]:
+    """
+    Compute GEPO (Group Expectation Policy Optimization) weights for stable importance sampling.
+
+    Traditional importance sampling uses w = p(y|x) / q(y|x), which explodes when q(y|x) is small.
+    GEPO uses w = p(y|x) / Ê_q[q(y|x)] where the group expectation is:
+        Ê_q[q(y|x)] = Σ(q(yi|x)²) / Σ(q(yi|x))
+    estimated from all G responses {y1...yG} for the same prompt x.
+
+    In log-space: log(Ê_q) = logsumexp(2*log_q) - logsumexp(log_q)
+
+    The GEPO correction term is: log_q(y|x) - log(Ê_q[q(y|x)])
+    This is a sequence-level correction that is applied uniformly to all tokens.
+
+    The importance ratio transforms from:
+        token-level: p(t|x,y<t) / q(t|x,y<t)
+    to:
+        sequence-level: p(y|x) / Ê_q[q(y|x)]
+
+    Args:
+        log_probs: List of per-token log probabilities for each sample, each tensor is [local_response_len]
+        loss_masks: List of per-token loss masks for each sample
+        group_indices: List of group indices (samples with same index share the same prompt)
+        total_lengths: Total sequence lengths per sample
+        response_lengths: Response lengths per sample
+        parallel_state: Parallel state for distributed computation
+
+    Returns:
+        gepo_corrections: List of GEPO correction tensors, each expanded to match log_probs shape.
+                         The sequence-level correction is broadcast to all tokens.
+        metrics: Dict with debugging metrics
+    """
+    from miles.backends.training_utils.cp_utils import all_gather_with_cp
+
+    num_samples = len(log_probs)
+    device = log_probs[0].device
+    dtype = log_probs[0].dtype
+
+    cp_size = parallel_state.cp_size
+    dp_group = parallel_state.dp_group
+
+    # Step 1: Compute sequence-level log probabilities for each sample
+    # log q(y|x) = Σ_t log q(t|x, y<t) * mask_t
+    seq_log_probs = []
+    for log_prob, loss_mask, total_len, resp_len in zip(
+        log_probs, loss_masks, total_lengths, response_lengths, strict=False
+    ):
+        if cp_size > 1:
+            # Gather full sequence log probs across CP ranks
+            full_log_prob = all_gather_with_cp(log_prob, total_len, resp_len, parallel_state)
+            # Loss mask is already full sequence in the batch
+            full_mask = loss_mask
+        else:
+            full_log_prob = log_prob
+            full_mask = loss_mask
+
+        # Sum over tokens to get sequence-level log prob
+        seq_lp = (full_log_prob * full_mask.float()).sum()
+        seq_log_probs.append(seq_lp)
+
+    local_seq_log_probs = torch.stack(seq_log_probs)  # [num_local_samples]
+    local_group_indices = torch.tensor(group_indices, device=device, dtype=torch.long)
+
+    # Step 2: All-gather sequence log probs and group indices across DP ranks
+    # This is necessary because samples from the same prompt may be on different DP ranks
+    if dp_group is not None and dist.get_world_size(dp_group) > 1:
+        dp_size = dist.get_world_size(dp_group)
+
+        # Gather sizes first (samples may be unevenly distributed)
+        local_size = torch.tensor([num_samples], device=device, dtype=torch.long)
+        all_sizes = [torch.zeros(1, device=device, dtype=torch.long) for _ in range(dp_size)]
+        dist.all_gather(all_sizes, local_size, group=dp_group)
+        all_sizes = [s.item() for s in all_sizes]
+
+        # Gather seq_log_probs
+        max_size = max(all_sizes)
+        padded_seq_log_probs = torch.zeros(max_size, device=device, dtype=dtype)
+        padded_seq_log_probs[:num_samples] = local_seq_log_probs
+        gathered_seq_log_probs = [torch.zeros(max_size, device=device, dtype=dtype) for _ in range(dp_size)]
+        dist.all_gather(gathered_seq_log_probs, padded_seq_log_probs, group=dp_group)
+
+        # Gather group_indices
+        padded_group_indices = torch.full((max_size,), -1, device=device, dtype=torch.long)
+        padded_group_indices[:num_samples] = local_group_indices
+        gathered_group_indices = [torch.full((max_size,), -1, device=device, dtype=torch.long) for _ in range(dp_size)]
+        dist.all_gather(gathered_group_indices, padded_group_indices, group=dp_group)
+
+        # Concatenate and filter valid entries
+        all_seq_log_probs = torch.cat([g[:s] for g, s in zip(gathered_seq_log_probs, all_sizes, strict=True)])
+        all_group_indices = torch.cat([g[:s] for g, s in zip(gathered_group_indices, all_sizes, strict=True)])
+    else:
+        all_seq_log_probs = local_seq_log_probs
+        all_group_indices = local_group_indices
+
+    # Step 3: Compute group expectation for each unique group
+    # Ê_q[q(y|x)] = Σ(q²) / Σ(q)
+    # In log-space: log(Ê_q) = logsumexp(2*log_q) - logsumexp(log_q)
+    unique_groups = torch.unique(all_group_indices)
+    group_log_expectations = {}
+
+    for g in unique_groups:
+        g_val = g.item()
+        if g_val == -1:  # Skip padding
+            continue
+        mask = all_group_indices == g
+        group_log_probs = all_seq_log_probs[mask]
+
+        # Numerical stability: clamp very low log probs
+        group_log_probs = torch.clamp(group_log_probs, min=-100.0)
+
+        log_sum_q = torch.logsumexp(group_log_probs, dim=0)
+        log_sum_q_squared = torch.logsumexp(2 * group_log_probs, dim=0)
+
+        log_E_q = log_sum_q_squared - log_sum_q
+        group_log_expectations[g_val] = log_E_q
+
+    # Step 4: Compute GEPO correction for each local sample
+    # correction = log_q(y|x) - log(Ê_q[q(y|x)])
+    # This transforms the ratio from p/q to p/Ê_q
+    # The correction is sequence-level but broadcast to all tokens
+    gepo_corrections = []
+    for i, (log_prob, gi) in enumerate(zip(log_probs, group_indices, strict=True)):
+        if gi is None or gi not in group_log_expectations:
+            # No group info, use zero correction (falls back to standard PPO)
+            correction = torch.zeros_like(log_prob)
+        else:
+            seq_lp = local_seq_log_probs[i]
+            log_E_q = group_log_expectations[gi]
+            # Sequence-level correction, broadcast to all tokens
+            scalar_correction = seq_lp - log_E_q
+            correction = scalar_correction.expand_as(log_prob)
+
+        gepo_corrections.append(correction)
+
+    # Step 5: Compute metrics for logging
+    all_corrections = torch.stack([c.mean() for c in gepo_corrections])
+    metrics = {
+        "gepo/seq_log_prob_mean": local_seq_log_probs.mean().detach(),
+        "gepo/seq_log_prob_std": local_seq_log_probs.std().detach() if num_samples > 1 else torch.tensor(0.0),
+        "gepo/correction_mean": all_corrections.mean().detach(),
+        "gepo/correction_std": all_corrections.std().detach() if num_samples > 1 else torch.tensor(0.0),
+        "gepo/num_groups": torch.tensor(float(len(group_log_expectations)), device=device),
+    }
+
+    return gepo_corrections, metrics

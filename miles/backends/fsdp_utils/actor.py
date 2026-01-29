@@ -454,6 +454,7 @@ class FSDPTrainRayActor(TrainRayActor):
                             "returns",
                             "ref_log_probs",
                             "rollout_log_probs",
+                            "group_indices",  # For GEPO
                         ],
                         self.parallel_state,
                         self.args.data_pad_size_multiplier,

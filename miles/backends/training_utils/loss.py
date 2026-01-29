@@ -10,6 +10,7 @@ from miles.utils.misc import load_function
 from miles.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
+    compute_gepo_weights,
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
@@ -271,7 +272,7 @@ def compute_advantages_and_returns(args: Namespace, parallel_state: ParallelStat
             for i in range(len(log_probs))
         ]
 
-    if args.advantage_estimator in ["grpo", "gspo"]:
+    if args.advantage_estimator in ["grpo", "gspo", "gepo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         # TODO: is the copy necessary?
@@ -524,6 +525,24 @@ def policy_loss_function(
             loss_masks=batch["loss_masks"],
         )
 
+    # Compute GEPO corrections if using GEPO advantage estimator
+    # GEPO modifies the importance ratio from p/q to p/Ê_q where Ê_q is the group expectation
+    # The correction is computed at sequence-level and applied uniformly to all tokens
+    gepo_metrics = {}
+    if args.advantage_estimator == "gepo":
+        group_indices = batch.get("group_indices")
+        if group_indices is None:
+            raise ValueError("group_indices must be provided in batch when advantage_estimator is gepo")
+
+        gepo_corrections, gepo_metrics = compute_gepo_weights(
+            log_probs=log_probs,
+            loss_masks=batch["loss_masks"],
+            group_indices=group_indices,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            parallel_state=parallel_state,
+        )
+
     # Compute KL divergence (GSPO uses sequence-level KL, others use per-token KL)
     if args.advantage_estimator == "gspo":
         ppo_kl = compute_gspo_kl(
@@ -538,6 +557,15 @@ def policy_loss_function(
         old_log_probs = torch.cat(old_log_probs, dim=0)
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
+
+    # Apply GEPO correction to the importance ratio
+    # Standard PPO: ratio = exp(-ppo_kl) = exp(log_probs - old_log_probs) = p/q
+    # With GEPO: ratio = p/Ê_q = p/q * q/Ê_q = exp(-ppo_kl) * exp(log_q - log_Ê_q)
+    # So: -ppo_kl_gepo = -ppo_kl + gepo_correction
+    # Or: ppo_kl_gepo = ppo_kl - gepo_correction
+    if args.advantage_estimator == "gepo":
+        gepo_correction_cat = torch.cat(gepo_corrections, dim=0)
+        ppo_kl = ppo_kl - gepo_correction_cat
 
     pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
 
@@ -660,6 +688,12 @@ def policy_loss_function(
 
     if args.use_opsm:
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
+
+    if args.advantage_estimator == "gepo":
+        for metric_key, metric_value in gepo_metrics.items():
+            reported_loss[metric_key] = (
+                metric_value.clone().detach() if hasattr(metric_value, "clone") else metric_value
+            )
 
     return loss, reported_loss
 

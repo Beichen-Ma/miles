@@ -327,7 +327,7 @@ class RolloutManager:
 
         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
         if (
-            self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
+            self.args.advantage_estimator in ["grpo", "gspo", "gepo", "reinforce_plus_plus_baseline"]
             and self.args.rewards_normalization
         ):
             # group norm
@@ -340,6 +340,7 @@ class RolloutManager:
             mean = rewards.mean(dim=-1, keepdim=True)
             rewards = rewards - mean
 
+            # GEPO does not use std normalization - its group-level importance weighting provides stability
             if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
                 std = rewards.std(dim=-1, keepdim=True)
                 rewards = rewards / (std + 1e-6)
@@ -369,6 +370,8 @@ class RolloutManager:
             "raw_reward": raw_rewards,
             "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
             "sample_indices": [sample.index for sample in samples],
+            # group_indices for GEPO: samples with same group_index share the same prompt
+            "group_indices": [sample.group_index for sample in samples],
         }
 
         # loss mask
@@ -446,6 +449,7 @@ class RolloutManager:
                 "loss_masks",
                 "round_number",
                 "sample_indices",
+                "group_indices",
                 "rollout_log_probs",
                 "rollout_routed_experts",
                 "prompt",

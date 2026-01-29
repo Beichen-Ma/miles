@@ -364,6 +364,7 @@ def train_one_step(
                 "returns",
                 "rollout_log_probs",
                 "max_seq_lens",
+                "group_indices",  # For GEPO
             ],
             parallel_state,
             args.data_pad_size_multiplier,
